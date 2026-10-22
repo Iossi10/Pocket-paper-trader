@@ -1,0 +1,221 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+from datetime import datetime, timezone
+
+st.set_page_config(page_title="Pocket Paper Trader", page_icon="📈", layout="centered")
+
+# PAPER-TRADING ONLY: this app contains no broker connection or order-placement code.
+STARTING_CASH = 100.00
+
+st.markdown("""
+<style>
+.block-container {max-width: 850px; padding-top: 1.2rem; padding-bottom: 2rem;}
+div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.25); padding: 12px; border-radius: 12px;}
+.stButton button {width: 100%; min-height: 2.7rem;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📈 Pocket Paper Trader")
+st.caption("Educational simulator • $100 starting balance • No real-money trading")
+
+with st.expander("How this works", expanded=False):
+    st.write("""
+    This dashboard downloads historical daily prices and replays them one candle at a time.
+    It is not a live trading bot and it does not connect to Robinhood, Crypto.com, or any broker.
+    All buys and sells are simulated. Historical results do not predict future performance.
+    """)
+    st.write("Strategy: buy when the short simple moving average crosses above the long average; sell when it crosses below. A simulated stop-loss is checked against each candle's low.")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    ticker = st.text_input("Stock ticker", value="AAPL", max_chars=10).strip().upper()
+with c2:
+    short_window = st.number_input("Short SMA", min_value=2, max_value=30, value=5, step=1)
+with c3:
+    long_window = st.number_input("Long SMA", min_value=3, max_value=100, value=20, step=1)
+
+stop_pct = st.slider("Simulated stop-loss (%)", min_value=1, max_value=20, value=5) / 100
+period = st.selectbox("Historical data range", ["3mo", "6mo", "1y"], index=1)
+if short_window >= long_window:
+    st.error("The short SMA must be smaller than the long SMA.")
+    st.stop()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_prices(symbol, period_value):
+    frame = yf.download(symbol, period=period_value, interval="1d", auto_adjust=True, progress=False)
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    frame = frame.rename(columns=str.title)
+    required = {"Open", "High", "Low", "Close"}
+    if not required.issubset(set(frame.columns)):
+        return pd.DataFrame()
+    frame = frame[["Open", "High", "Low", "Close"]].dropna().copy()
+    frame["SMA_Short"] = frame["Close"].rolling(int(short_window)).mean()
+    frame["SMA_Long"] = frame["Close"].rolling(int(long_window)).mean()
+    return frame.dropna().copy()
+
+if not ticker:
+    st.info("Enter a stock ticker to begin.")
+    st.stop()
+
+with st.spinner(f"Loading historical prices for {ticker}…"):
+    data = load_prices(ticker, period)
+
+if data.empty or len(data) < 2:
+    st.error("No usable price history was found. Check the ticker and try again.")
+    st.stop()
+
+# Reset the replay automatically when the stock or strategy settings change.
+config_key = (ticker, int(short_window), int(long_window), int(stop_pct * 100), period)
+if st.session_state.get("config_key") != config_key:
+    st.session_state.config_key = config_key
+    st.session_state.step = 1
+    st.session_state.cash = STARTING_CASH
+    st.session_state.shares = 0.0
+    st.session_state.entry_price = None
+    st.session_state.stop_price = None
+    st.session_state.trades = []
+    st.session_state.daily_log = []
+
+def sma_signal(frame, i):
+    if i < 1:
+        return None
+    prev = frame.iloc[i - 1]
+    cur = frame.iloc[i]
+    if prev["SMA_Short"] <= prev["SMA_Long"] and cur["SMA_Short"] > cur["SMA_Long"]:
+        return "BUY"
+    if prev["SMA_Short"] >= prev["SMA_Long"] and cur["SMA_Short"] < cur["SMA_Long"]:
+        return "SELL"
+    return None
+
+def process_bar(i):
+    row = data.iloc[i]
+    date_label = data.index[i].strftime("%Y-%m-%d")
+    close = float(row["Close"])
+    low = float(row["Low"])
+    signal = sma_signal(data, i)
+    action = "HOLD"
+    note = "No crossover; position unchanged."
+
+    # Stop-loss has priority when already holding a position.
+    if st.session_state.shares > 0 and st.session_state.stop_price is not None and low <= st.session_state.stop_price:
+        exit_price = min(float(st.session_state.stop_price), close)
+        proceeds = st.session_state.shares * exit_price
+        cost_basis = st.session_state.shares * float(st.session_state.entry_price)
+        pnl = proceeds - cost_basis
+        st.session_state.cash += proceeds
+        st.session_state.trades.append({
+            "Date": date_label, "Action": "STOP LOSS SELL", "Price": exit_price,
+            "Shares": st.session_state.shares, "Realized P/L": pnl
+        })
+        st.session_state.shares = 0.0
+        st.session_state.entry_price = None
+        st.session_state.stop_price = None
+        action = "STOP LOSS SELL"
+        note = "The candle low touched the stop. Fill is simulated conservatively; gaps/slippage may differ in reality."
+    elif signal == "BUY" and st.session_state.shares == 0 and st.session_state.cash > 0:
+        # Buy at the candle close in the simulator, using available cash and fractional shares.
+        st.session_state.shares = st.session_state.cash / close
+        st.session_state.entry_price = close
+        st.session_state.stop_price = close * (1 - stop_pct)
+        st.session_state.cash = 0.0
+        st.session_state.trades.append({
+            "Date": date_label, "Action": "BUY", "Price": close,
+            "Shares": st.session_state.shares, "Realized P/L": 0.0
+        })
+        action = "BUY"
+        note = f"Simulated entry at close; stop-loss level set to ${st.session_state.stop_price:.2f}."
+    elif signal == "SELL" and st.session_state.shares > 0:
+        proceeds = st.session_state.shares * close
+        cost_basis = st.session_state.shares * float(st.session_state.entry_price)
+        pnl = proceeds - cost_basis
+        st.session_state.cash += proceeds
+        st.session_state.trades.append({
+            "Date": date_label, "Action": "SELL", "Price": close,
+            "Shares": st.session_state.shares, "Realized P/L": pnl
+        })
+        st.session_state.shares = 0.0
+        st.session_state.entry_price = None
+        st.session_state.stop_price = None
+        action = "SELL"
+        note = "Simulated exit at close after a bearish crossover."
+    st.session_state.daily_log.append({
+        "Date": date_label, "Close": close, "Short SMA": float(row["SMA_Short"]),
+        "Long SMA": float(row["SMA_Long"]), "Signal": signal or "—",
+        "Action": action, "Notes": note
+    })
+
+# Keep step bounded; processing occurs only on explicit button clicks.
+st.session_state.step = min(max(int(st.session_state.get("step", 1)), 1), len(data) - 1)
+current_i = st.session_state.step
+current_row = data.iloc[current_i]
+if current_i >= len(data) - 1:
+    st.warning("Replay is at the last available historical candle. Reset the replay to start again.")
+
+button1, button2 = st.columns(2)
+with button1:
+    if st.button("▶ Run next trading day", disabled=current_i >= len(data) - 1):
+        process_bar(current_i)
+        st.session_state.step = min(current_i + 1, len(data) - 1)
+        st.rerun()
+with button2:
+    if st.button("↺ Reset replay"):
+        st.session_state.config_key = None
+        st.rerun()
+
+# Mark current portfolio to the market at the currently selected replay candle.
+current_price = float(current_row["Close"])
+market_value = st.session_state.shares * current_price
+equity = st.session_state.cash + market_value
+realized_pnl = sum(float(t["Realized P/L"]) for t in st.session_state.trades)
+unrealized_pnl = (current_price - float(st.session_state.entry_price)) * st.session_state.shares if st.session_state.shares > 0 else 0.0
+total_pnl = equity - STARTING_CASH
+
+st.subheader(f"{ticker} • Replay date: {data.index[current_i].strftime('%b %d, %Y')}")
+m1, m2 = st.columns(2)
+m1.metric("Simulated account value", f"${equity:,.2f}", f"{total_pnl:+.2f} vs. start")
+m2.metric("Cash available", f"${st.session_state.cash:,.2f}")
+m3, m4 = st.columns(2)
+m3.metric("Realized P/L", f"${realized_pnl:+,.2f}")
+m4.metric("Unrealized P/L", f"${unrealized_pnl:+,.2f}")
+
+signal_now = sma_signal(data, current_i)
+if st.session_state.shares > 0:
+    st.info(f"Position: {st.session_state.shares:.6f} shares • Entry ${st.session_state.entry_price:.2f} • Stop ${st.session_state.stop_price:.2f}")
+else:
+    st.info("Position: flat (no shares held)")
+if signal_now == "BUY":
+    st.success("Latest candle signal: BUY crossover (signal only; trade executes only when you click Run next trading day).")
+elif signal_now == "SELL":
+    st.warning("Latest candle signal: SELL crossover (signal only; trade executes only when you click Run next trading day).")
+else:
+    st.caption("Latest candle signal: no moving-average crossover.")
+
+plot = data[["Close", "SMA_Short", "SMA_Long"]].iloc[max(0, current_i - 90):current_i + 1].copy()
+plot.columns = ["Close", f"SMA {short_window}", f"SMA {long_window}"]
+st.line_chart(plot, height=260)
+
+st.subheader("Daily trade summary")
+if st.session_state.daily_log:
+    logs = pd.DataFrame(st.session_state.daily_log)
+    st.dataframe(logs.iloc[::-1], use_container_width=True, hide_index=True)
+    buys = sum(1 for t in st.session_state.trades if t["Action"] == "BUY")
+    sells = sum(1 for t in st.session_state.trades if t["Action"] != "BUY")
+    st.caption(f"Replay steps processed: {len(logs)} • Buy entries: {buys} • Exits: {sells}")
+else:
+    st.write("No replay days processed yet. Tap **Run next trading day** to step through the historical candles.")
+
+st.subheader("Trade history")
+if st.session_state.trades:
+    trades = pd.DataFrame(st.session_state.trades)
+    trades["Price"] = trades["Price"].map(lambda x: f"${x:.2f}")
+    trades["Shares"] = trades["Shares"].map(lambda x: f"{x:.6f}")
+    trades["Realized P/L"] = trades["Realized P/L"].map(lambda x: f"${x:+.2f}")
+    st.dataframe(trades.iloc[::-1], use_container_width=True, hide_index=True)
+else:
+    st.write("No simulated trades yet.")
+
+st.caption("Data source: Yahoo Finance via yfinance. Prices can be delayed, incomplete, or unavailable. No fees, taxes, spreads, or slippage are fully modeled. Stop-loss execution is only an approximation. This app cannot place real orders.")
